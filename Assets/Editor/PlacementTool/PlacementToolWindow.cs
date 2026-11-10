@@ -52,6 +52,8 @@ namespace PlacementTool.Editor
         [SerializeField] bool alignBottom;
         [SerializeField] float groundHeight;
         [SerializeField] bool selectPlaced = true;
+        [SerializeField] float placeYaw;          // 配置時に追加するY回転（0 ならプレハブのまま）
+        [SerializeField] float rotateStep = 90f;
 
         [SerializeField] float lineSpacing = 2f;
         [SerializeField] bool lineSnapToGrid;
@@ -350,6 +352,15 @@ namespace PlacementTool.Editor
             groundHeight = EditorGUILayout.FloatField(
                 new GUIContent("地面の高さ", "何もない場所をクリックしたときに使う水平面の高さ (Y)"), groundHeight);
             selectPlaced = EditorGUILayout.Toggle("配置後に選択する", selectPlaced);
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                placeYaw = Mathf.Repeat(EditorGUILayout.FloatField(
+                    new GUIContent("配置時の回転 Y (°)", "シーンビューで ←/→ キーで回転、↓ キーで 0 に戻す。0 ならプレハブの回転のまま"),
+                    placeYaw), 360f);
+                if (GUILayout.Button("0", GUILayout.Width(28))) placeYaw = 0f;
+            }
+            rotateStep = Mathf.Clamp(EditorGUILayout.FloatField(
+                new GUIContent("回転ステップ (°)", "←/→ キー 1 回あたりの角度。Shift 押しながらで 1/6（90°なら15°）"), rotateStep), 1f, 180f);
         }
 
         void DrawLineGUI()
@@ -500,6 +511,25 @@ namespace PlacementTool.Editor
                         Repaint();
                         e.Use();
                     }
+                    else if (!e.alt && !e.control && !e.command &&
+                             (e.keyCode == KeyCode.LeftArrow || e.keyCode == KeyCode.RightArrow || e.keyCode == KeyCode.DownArrow))
+                    {
+                        // ←/→: 回転、↓: リセット（シーンビューのカメラ移動より優先）
+                        float step = e.shift ? rotateStep / 6f : rotateStep;
+                        if (e.keyCode == KeyCode.LeftArrow) placeYaw -= step;
+                        else if (e.keyCode == KeyCode.RightArrow) placeYaw += step;
+                        else placeYaw = 0f;
+                        placeYaw = Mathf.Repeat(Mathf.Round(placeYaw * 1000f) / 1000f, 360f);
+                        SavePrefs();
+                        UpdateHover(e.mousePosition);
+                        Repaint();
+                        sv.Repaint();
+                        e.Use();
+                    }
+                    else if (e.keyCode == KeyCode.UpArrow && !e.alt && !e.control && !e.command)
+                    {
+                        e.Use(); // ↑ でカメラが動かないように
+                    }
                     break;
 
                 case EventType.Repaint:
@@ -521,6 +551,7 @@ namespace PlacementTool.Editor
                     case Mode.Connect: state = anchor ? $"基準: {anchor.name}" : "最初のパーツをクリックで配置"; break;
                     default: state = $"左クリックで配置: {prefab.name}"; break;
                 }
+                state += $"\n回転 Y: {placeYaw:0.#}°（←/→ で回転・↓ でリセット）";
             }
 
             var content = new GUIContent($"Placement Tool  {ModeLabels[(int)mode]}\n{state}");
@@ -609,7 +640,7 @@ namespace PlacementTool.Editor
                     }
                     else if (connectHasTarget)
                     {
-                        Vector3 pivot = connectTargetCenter - GetPrefabLocalBounds().center;
+                        Vector3 pivot = connectTargetCenter - GetPlacementLocalBounds().center;
                         var created = PlaceMany(new[] { pivot }, "Place Prefab (Connect)", connectTargetCenter);
                         if (created.Count > 0) anchor = created[0];
                     }
@@ -630,7 +661,7 @@ namespace PlacementTool.Editor
             if (mode != Mode.Connect || !anchor || !hasHover || !prefab) return;
 
             Bounds a = GetWorldBounds(anchor);
-            Bounds lb = GetPrefabLocalBounds();
+            Bounds lb = GetPlacementLocalBounds();
             Vector3 d = hoverPoint - a.center;
             Vector3 ext = a.extents;
 
@@ -710,7 +741,7 @@ namespace PlacementTool.Editor
                     {
                         DrawFace(a, connectAxis, connectSign, AnchorColor);
                         Handles.color = TargetColor;
-                        Handles.DrawWireCube(connectTargetCenter, lb.size);
+                        DrawPivotBox(connectTargetCenter - GetPlacementLocalBounds().center, lb, TargetColor);
                     }
                     break;
 
@@ -720,11 +751,42 @@ namespace PlacementTool.Editor
             }
         }
 
-        static void DrawPivotBox(Vector3 pivot, Bounds localBounds, Color color)
+        // 配置後の向き（追加のY回転込み）で箱を描く。矢印は Z+（前方向）
+        void DrawPivotBox(Vector3 pivot, Bounds localBounds, Color color)
         {
+            Quaternion q = PlacementRotation;
             Handles.color = color;
-            Handles.DrawWireCube(pivot + localBounds.center, localBounds.size);
+            using (new Handles.DrawingScope(color, Matrix4x4.TRS(pivot, q, Vector3.one)))
+            {
+                Handles.DrawWireCube(localBounds.center, localBounds.size);
+            }
             DrawMarker(pivot, color);
+
+            if (Mathf.Abs(placeYaw) > 0.01f || mode != Mode.Line)
+            {
+                Vector3 fwd = q * (prefab ? prefab.transform.forward : Vector3.forward);
+                fwd.y = 0f;
+                if (fwd.sqrMagnitude > 1e-6f)
+                {
+                    float len = HandleUtility.GetHandleSize(pivot) * 0.4f;
+                    Handles.color = color;
+                    Handles.DrawLine(pivot, pivot + fwd.normalized * len);
+                    Handles.ConeHandleCap(0, pivot + fwd.normalized * len, Quaternion.LookRotation(fwd), len * 0.25f, EventType.Repaint);
+                }
+            }
+        }
+
+        Quaternion PlacementRotation => Quaternion.Euler(0f, placeYaw, 0f);
+
+        // 追加回転を反映したピボット基準のAABB（連結モード用）
+        Bounds GetPlacementLocalBounds()
+        {
+            Bounds lb = GetPrefabLocalBounds();
+            if (Mathf.Abs(placeYaw) < 0.001f) return lb;
+            bool has = false;
+            Bounds r = default;
+            Encapsulate(ref has, ref r, lb, Matrix4x4.Rotate(PlacementRotation));
+            return r;
         }
 
         static void DrawMarker(Vector3 p, Color color)
@@ -850,6 +912,8 @@ namespace PlacementTool.Editor
 
             if (par) go.transform.SetParent(par, true); // ワールドの回転・スケールを維持
             go.transform.position = pivot;
+            if (Mathf.Abs(placeYaw) > 0.001f)
+                go.transform.rotation = PlacementRotation * go.transform.rotation; // ←/→ キーで指定したY回転を追加
 
             // 親のスケールなどでズレた分をバウンズで補正（位置のみ）
             if (desiredBoundsCenter.HasValue && TryGetWorldBounds(go, out var b))
@@ -1334,6 +1398,8 @@ namespace PlacementTool.Editor
             EditorPrefs.SetBool(Pref + "AlignBottom", alignBottom);
             EditorPrefs.SetFloat(Pref + "GroundHeight", groundHeight);
             EditorPrefs.SetBool(Pref + "SelectPlaced", selectPlaced);
+            EditorPrefs.SetFloat(Pref + "PlaceYaw", placeYaw);
+            EditorPrefs.SetFloat(Pref + "RotateStep", rotateStep);
             EditorPrefs.SetFloat(Pref + "LineSpacing", lineSpacing);
             EditorPrefs.SetBool(Pref + "LineSnap", lineSnapToGrid);
             EditorPrefs.SetBool(Pref + "LineChain", lineChain);
@@ -1376,6 +1442,8 @@ namespace PlacementTool.Editor
             alignBottom = EditorPrefs.GetBool(Pref + "AlignBottom", alignBottom);
             groundHeight = EditorPrefs.GetFloat(Pref + "GroundHeight", groundHeight);
             selectPlaced = EditorPrefs.GetBool(Pref + "SelectPlaced", selectPlaced);
+            placeYaw = EditorPrefs.GetFloat(Pref + "PlaceYaw", placeYaw);
+            rotateStep = EditorPrefs.GetFloat(Pref + "RotateStep", rotateStep);
             lineSpacing = EditorPrefs.GetFloat(Pref + "LineSpacing", lineSpacing);
             lineSnapToGrid = EditorPrefs.GetBool(Pref + "LineSnap", lineSnapToGrid);
             lineChain = EditorPrefs.GetBool(Pref + "LineChain", lineChain);
