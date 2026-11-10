@@ -27,9 +27,11 @@ namespace PlacementTool.Editor
 {
     public class PlacementToolWindow : EditorWindow
     {
-        enum Mode { Place, Line, Grid, Connect, CopyUp, Utility }
+        enum Mode { Place, Line, Grid, Connect, CopyUp, Utility, ObjectSnap }
+        enum SnapYMode { SameAsBase, Step, Cursor }
+        static readonly GUIContent[] SnapYLabels = { new GUIContent("基準と同じ高さ"), new GUIContent("ステップでスナップ"), new GUIContent("カーソル位置") };
 
-        static readonly string[] ModeLabels = { "① 配置", "② ライン", "③ グリッド", "④ 連結", "⑤ 上にコピー", "⑥ 選択・名前" };
+        static readonly string[] ModeLabels = { "① 配置", "② ライン", "③ グリッド", "④ 連結", "⑤ 上にコピー", "⑥ 選択・名前", "⑦ オブジェクトスナップ" };
         const string Pref = "PlacementTool.";
         const int MaxLineCount = 1000;
         const int MaxPreviewCount = 300;
@@ -63,6 +65,13 @@ namespace PlacementTool.Editor
         [SerializeField] float connectGap;
         [SerializeField] bool connectAllowVertical;
 
+        [SerializeField] Vector3 objSnapStep = new Vector3(3f, 4f, 3f);
+        [SerializeField] SnapYMode objSnapY = SnapYMode.SameAsBase;
+        [SerializeField] bool objSnapLocalAxes;
+        [SerializeField] bool objSnapUsePrefabRoot = true;
+        [SerializeField] bool objSnapSkipBase = true;
+        [SerializeField] bool objSnapShowCandidates = true;
+
         [SerializeField] float copyHeight = 4f;
 
         [SerializeField] bool renameIncludeChildren;
@@ -79,6 +88,10 @@ namespace PlacementTool.Editor
         bool lineSkipFirst;
 
         bool connectHasTarget;
+
+        GameObject snapBase;
+        bool snapHasTarget;
+        Vector3 snapTarget;
         Vector3 connectTargetCenter;
         Bounds connectAnchorBounds;
         int connectAxis;
@@ -144,7 +157,7 @@ namespace PlacementTool.Editor
         void OnGUI()
         {
             EditorGUI.BeginChangeCheck();
-            var newMode = (Mode)GUILayout.SelectionGrid((int)mode, ModeLabels, 3, GUILayout.Height(48));
+            var newMode = (Mode)GUILayout.SelectionGrid((int)mode, ModeLabels, 3, GUILayout.Height(72));
             if (EditorGUI.EndChangeCheck())
             {
                 mode = newMode;
@@ -178,6 +191,7 @@ namespace PlacementTool.Editor
                     case Mode.Line: DrawLineGUI(); break;
                     case Mode.Grid: DrawGridGUI(); break;
                     case Mode.Connect: DrawConnectGUI(); break;
+                    case Mode.ObjectSnap: DrawObjectSnapGUI(); break;
                 }
             }
 
@@ -330,7 +344,7 @@ namespace PlacementTool.Editor
             EditorGUILayout.LabelField("配置設定", EditorStyles.boldLabel);
             parent = (Transform)EditorGUILayout.ObjectField(
                 new GUIContent("親（任意）", "配置したオブジェクトをこの Transform の子にします"), parent, typeof(Transform), true);
-            if (mode != Mode.Connect)
+            if (mode != Mode.Connect && mode != Mode.ObjectSnap)
                 alignBottom = EditorGUILayout.Toggle(
                     new GUIContent("底面を接地", "ピボットではなくバウンズの底面をクリックした面に合わせます"), alignBottom);
             groundHeight = EditorGUILayout.FloatField(
@@ -419,6 +433,7 @@ namespace PlacementTool.Editor
                 case Mode.Place: return "シーンビューを左クリックした位置にプレハブを配置します。\nAlt+ドラッグでの視点操作はそのまま使えます。";
                 case Mode.Line: return "1回目のクリックで始点、2回目で終点。その間に一定間隔で並べます。\nEsc で始点をキャンセル。";
                 case Mode.Grid: return "クリック位置をグリッドにスナップして配置します。\nカーソル付近にグリッド線を表示します。";
+                case Mode.ObjectSnap: return "カーソルが指しているオブジェクトのピボット位置を基準に、「ステップ」の倍数（+3, -3, +6 …）の位置にだけスナップして配置します。\n例: ステップ X=3 なら、基準の壁の左右 3m ごとの位置に吸着します。\n配置したパーツにカーソルを合わせれば、そこから続けて置けます。";
                 case Mode.Connect: return "基準パーツの端（カーソルに近い面）に次のパーツをくっつけて配置します。\n基準が無いときは最初のクリックで普通に配置し、それが基準になります。\n配置するたびに基準は最新のパーツに切り替わります。";
                 case Mode.Utility: return "【名前の (1) を削除】選択オブジェクトの名前末尾の \" (1)\" \"(2)\" などを消します。\n【同じプレハブを一括選択】選択オブジェクトと同じプレハブのインスタンスを、開いているシーンからまとめて選択します。";
                 case Mode.CopyUp: return "ヒエラルキー／シーンで選んだオブジェクトを、回転・スケールそのままで指定の高さ上に複製します。\nプレハブのリンクも保持されます。";
@@ -432,7 +447,7 @@ namespace PlacementTool.Editor
 
         void OnSceneGUI(SceneView sv)
         {
-            if (!sceneInputEnabled || mode >= Mode.CopyUp) return;
+            if (!sceneInputEnabled || mode == Mode.CopyUp || mode == Mode.Utility) return;
 
             Event e = Event.current;
             if (e.type == EventType.Repaint) DrawHud();
@@ -502,6 +517,7 @@ namespace PlacementTool.Editor
                 switch (mode)
                 {
                     case Mode.Line: state = lineHasStart ? "終点をクリック（Escでキャンセル）" : "始点をクリック"; break;
+                    case Mode.ObjectSnap: state = snapBase ? $"基準: {snapBase.name}" : "オブジェクトにカーソルを合わせてください"; break;
                     case Mode.Connect: state = anchor ? $"基準: {anchor.name}" : "最初のパーツをクリックで配置"; break;
                     default: state = $"左クリックで配置: {prefab.name}"; break;
                 }
@@ -519,6 +535,7 @@ namespace PlacementTool.Editor
         {
             hasHover = RaycastScene(mousePosition, out hoverPoint);
             UpdateConnectTarget();
+            UpdateObjectSnapTarget(mousePosition);
         }
 
         bool RaycastScene(Vector2 mousePosition, out Vector3 point)
@@ -598,6 +615,11 @@ namespace PlacementTool.Editor
                     }
                     UpdateConnectTarget();
                     Repaint();
+                    break;
+
+                case Mode.ObjectSnap:
+                    if (snapHasTarget)
+                        PlaceMany(new[] { snapTarget }, "Place Prefab (Object Snap)");
                     break;
             }
         }
@@ -690,6 +712,10 @@ namespace PlacementTool.Editor
                         Handles.color = TargetColor;
                         Handles.DrawWireCube(connectTargetCenter, lb.size);
                     }
+                    break;
+
+                case Mode.ObjectSnap:
+                    DrawObjectSnapPreview(lb);
                     break;
             }
         }
@@ -926,6 +952,126 @@ namespace PlacementTool.Editor
         }
 
         // =====================================================================
+        // ⑦ オブジェクトスナップ
+        // =====================================================================
+
+        void DrawObjectSnapGUI()
+        {
+            EditorGUILayout.LabelField("オブジェクトスナップ設定", EditorStyles.boldLabel);
+            objSnapStep = EditorGUILayout.Vector3Field(
+                new GUIContent("ステップ (m)", "基準オブジェクトからこの距離の倍数の位置にスナップします。0 の軸はスナップせずカーソル位置を使います"),
+                objSnapStep);
+            objSnapStep = new Vector3(Mathf.Max(0f, objSnapStep.x), Mathf.Max(0f, objSnapStep.y), Mathf.Max(0f, objSnapStep.z));
+
+            if (prefab)
+            {
+                var size = GetPrefabLocalBounds().size;
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    EditorGUILayout.PrefixLabel(" ");
+                    if (GUILayout.Button("ステップ = プレハブのサイズ", EditorStyles.miniButton))
+                        objSnapStep = new Vector3(Round3(size.x), Round3(size.y), Round3(size.z));
+                }
+            }
+
+            objSnapY = (SnapYMode)EditorGUILayout.Popup(
+                new GUIContent("高さ (Y)", "基準と同じ高さ: 基準のピボットと同じY\nステップでスナップ: Y もステップの倍数\nカーソル位置: 当たった面の高さ"),
+                (int)objSnapY, SnapYLabels);
+            objSnapLocalAxes = EditorGUILayout.Toggle(
+                new GUIContent("基準のローカル軸で並べる", "ON: 基準オブジェクトの向きに沿ってステップを取ります（置くプレハブの回転は変えません）"),
+                objSnapLocalAxes);
+            objSnapUsePrefabRoot = EditorGUILayout.Toggle(
+                new GUIContent("プレハブのルートを基準にする", "ON: 子メッシュを指していても、そのプレハブのルートのピボットを基準にします"),
+                objSnapUsePrefabRoot);
+            objSnapSkipBase = EditorGUILayout.Toggle("基準と同じ位置には置かない", objSnapSkipBase);
+            objSnapShowCandidates = EditorGUILayout.Toggle("スナップ候補を表示", objSnapShowCandidates);
+        }
+
+        static float Round3(float v) => Mathf.Round(v * 1000f) / 1000f;
+
+        GameObject PickSnapBase(Vector2 mousePosition)
+        {
+            var picked = HandleUtility.PickGameObject(mousePosition, false);
+            if (!picked) return null;
+            if (objSnapUsePrefabRoot)
+            {
+                var root = PrefabUtility.GetNearestPrefabInstanceRoot(picked);
+                if (root) return root;
+            }
+            return picked;
+        }
+
+        Quaternion SnapAxesRotation(Transform baseT) => objSnapLocalAxes ? baseT.rotation : Quaternion.identity;
+
+        void UpdateObjectSnapTarget(Vector2 mousePosition)
+        {
+            snapHasTarget = false;
+            if (mode != Mode.ObjectSnap || !prefab) return;
+
+            snapBase = PickSnapBase(mousePosition);
+            if (!snapBase || !hasHover) return;
+
+            Transform bt = snapBase.transform;
+            Vector3 basePos = bt.position;
+            Quaternion rot = SnapAxesRotation(bt);
+
+            // 基準ピボットからのオフセットを（必要なら基準の向きで）ステップの倍数に丸める
+            Vector3 local = Quaternion.Inverse(rot) * (hoverPoint - basePos);
+            local.x = SnapAxis(local.x, objSnapStep.x);
+            local.z = SnapAxis(local.z, objSnapStep.z);
+            switch (objSnapY)
+            {
+                case SnapYMode.SameAsBase: local.y = 0f; break;
+                case SnapYMode.Step: local.y = SnapAxis(local.y, objSnapStep.y); break;
+                case SnapYMode.Cursor: break;
+            }
+
+            if (objSnapSkipBase && local.sqrMagnitude < 1e-6f) return;
+
+            snapTarget = basePos + rot * local;
+            snapHasTarget = true;
+        }
+
+        static float SnapAxis(float v, float step) => step > 1e-4f ? Mathf.Round(v / step) * step : v;
+
+        void DrawObjectSnapPreview(Bounds lb)
+        {
+            if (!snapBase) return;
+
+            Transform bt = snapBase.transform;
+            Bounds bb = GetWorldBounds(snapBase);
+            Handles.color = AnchorColor;
+            Handles.DrawWireCube(bb.center, bb.size);
+            DrawMarker(bt.position, AnchorColor);
+
+            if (objSnapShowCandidates)
+            {
+                Quaternion rot = SnapAxesRotation(bt);
+                float yOff = objSnapY == SnapYMode.Cursor && snapHasTarget
+                    ? (Quaternion.Inverse(rot) * (snapTarget - bt.position)).y
+                    : 0f;
+                Handles.color = new Color(1f, 1f, 1f, 0.6f);
+                for (int ix = -2; ix <= 2; ix++)
+                for (int iz = -2; iz <= 2; iz++)
+                {
+                    if (objSnapStep.x <= 1e-4f && ix != 0) continue;
+                    if (objSnapStep.z <= 1e-4f && iz != 0) continue;
+                    Vector3 c = bt.position + rot * new Vector3(ix * objSnapStep.x, yOff, iz * objSnapStep.z);
+                    Handles.DotHandleCap(0, c, Quaternion.identity, HandleUtility.GetHandleSize(c) * 0.03f, EventType.Repaint);
+                }
+            }
+
+            if (snapHasTarget)
+            {
+                DrawPivotBox(snapTarget, lb, TargetColor);
+                Handles.color = TargetColor;
+                Handles.DrawDottedLine(bt.position, snapTarget, 3f);
+                Vector3 d = Quaternion.Inverse(SnapAxesRotation(bt)) * (snapTarget - bt.position);
+                Handles.Label(snapTarget + Vector3.up * 0.3f, $"X{d.x:+0.##;-0.##;0}  Y{d.y:+0.##;-0.##;0}  Z{d.z:+0.##;-0.##;0}", EditorStyles.whiteBoldLabel);
+            }
+        }
+
+        // =====================================================================
         // ⑥ 選択・名前
         // =====================================================================
 
@@ -1084,6 +1230,8 @@ namespace PlacementTool.Editor
             lineSkipFirst = false;
             hasHover = false;
             connectHasTarget = false;
+            snapBase = null;
+            snapHasTarget = false;
         }
 
         Bounds GetPrefabLocalBounds()
@@ -1196,6 +1344,14 @@ namespace PlacementTool.Editor
             EditorPrefs.SetBool(Pref + "GridSnapY", gridSnapY);
             EditorPrefs.SetFloat(Pref + "ConnectGap", connectGap);
             EditorPrefs.SetBool(Pref + "ConnectVertical", connectAllowVertical);
+            EditorPrefs.SetFloat(Pref + "ObjSnapX", objSnapStep.x);
+            EditorPrefs.SetFloat(Pref + "ObjSnapY", objSnapStep.y);
+            EditorPrefs.SetFloat(Pref + "ObjSnapZ", objSnapStep.z);
+            EditorPrefs.SetInt(Pref + "ObjSnapYMode", (int)objSnapY);
+            EditorPrefs.SetBool(Pref + "ObjSnapLocal", objSnapLocalAxes);
+            EditorPrefs.SetBool(Pref + "ObjSnapPrefabRoot", objSnapUsePrefabRoot);
+            EditorPrefs.SetBool(Pref + "ObjSnapSkipBase", objSnapSkipBase);
+            EditorPrefs.SetBool(Pref + "ObjSnapCandidates", objSnapShowCandidates);
             EditorPrefs.SetFloat(Pref + "CopyHeight", copyHeight);
             EditorPrefs.SetBool(Pref + "RenameChildren", renameIncludeChildren);
             EditorPrefs.SetBool(Pref + "RenameClone", renameRemoveClone);
@@ -1231,6 +1387,15 @@ namespace PlacementTool.Editor
             gridSnapY = EditorPrefs.GetBool(Pref + "GridSnapY", gridSnapY);
             connectGap = EditorPrefs.GetFloat(Pref + "ConnectGap", connectGap);
             connectAllowVertical = EditorPrefs.GetBool(Pref + "ConnectVertical", connectAllowVertical);
+            objSnapStep = new Vector3(
+                EditorPrefs.GetFloat(Pref + "ObjSnapX", objSnapStep.x),
+                EditorPrefs.GetFloat(Pref + "ObjSnapY", objSnapStep.y),
+                EditorPrefs.GetFloat(Pref + "ObjSnapZ", objSnapStep.z));
+            objSnapY = (SnapYMode)Mathf.Clamp(EditorPrefs.GetInt(Pref + "ObjSnapYMode", (int)objSnapY), 0, SnapYLabels.Length - 1);
+            objSnapLocalAxes = EditorPrefs.GetBool(Pref + "ObjSnapLocal", objSnapLocalAxes);
+            objSnapUsePrefabRoot = EditorPrefs.GetBool(Pref + "ObjSnapPrefabRoot", objSnapUsePrefabRoot);
+            objSnapSkipBase = EditorPrefs.GetBool(Pref + "ObjSnapSkipBase", objSnapSkipBase);
+            objSnapShowCandidates = EditorPrefs.GetBool(Pref + "ObjSnapCandidates", objSnapShowCandidates);
             copyHeight = EditorPrefs.GetFloat(Pref + "CopyHeight", copyHeight);
             renameIncludeChildren = EditorPrefs.GetBool(Pref + "RenameChildren", renameIncludeChildren);
             renameRemoveClone = EditorPrefs.GetBool(Pref + "RenameClone", renameRemoveClone);
