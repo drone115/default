@@ -16,6 +16,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
@@ -26,9 +27,9 @@ namespace PlacementTool.Editor
 {
     public class PlacementToolWindow : EditorWindow
     {
-        enum Mode { Place, Line, Grid, Connect, CopyUp }
+        enum Mode { Place, Line, Grid, Connect, CopyUp, Utility }
 
-        static readonly string[] ModeLabels = { "① 配置", "② ライン", "③ グリッド", "④ 連結", "⑤ 上にコピー" };
+        static readonly string[] ModeLabels = { "① 配置", "② ライン", "③ グリッド", "④ 連結", "⑤ 上にコピー", "⑥ 選択・名前" };
         const string Pref = "PlacementTool.";
         const int MaxLineCount = 1000;
         const int MaxPreviewCount = 300;
@@ -64,6 +65,11 @@ namespace PlacementTool.Editor
 
         [SerializeField] float copyHeight = 4f;
 
+        [SerializeField] bool renameIncludeChildren;
+        [SerializeField] bool renameRemoveClone = true;
+        [SerializeField] bool selectMatchVariantBase;
+        [SerializeField] bool selectIncludeInactive = true;
+
         // ---- 一時状態 ----
         bool hasHover;
         Vector3 hoverPoint;
@@ -96,7 +102,7 @@ namespace PlacementTool.Editor
         {
             var w = GetWindow<PlacementToolWindow>();
             w.titleContent = new GUIContent("Placement Tool", EditorGUIUtility.IconContent("Prefab Icon").image);
-            w.minSize = new Vector2(300, 320);
+            w.minSize = new Vector2(320, 340);
             w.Show();
         }
 
@@ -138,7 +144,7 @@ namespace PlacementTool.Editor
         void OnGUI()
         {
             EditorGUI.BeginChangeCheck();
-            var newMode = (Mode)GUILayout.Toolbar((int)mode, ModeLabels, GUILayout.Height(26));
+            var newMode = (Mode)GUILayout.SelectionGrid((int)mode, ModeLabels, 3, GUILayout.Height(48));
             if (EditorGUI.EndChangeCheck())
             {
                 mode = newMode;
@@ -154,6 +160,10 @@ namespace PlacementTool.Editor
             if (mode == Mode.CopyUp)
             {
                 DrawCopyUpGUI();
+            }
+            else if (mode == Mode.Utility)
+            {
+                DrawUtilityGUI();
             }
             else
             {
@@ -410,6 +420,7 @@ namespace PlacementTool.Editor
                 case Mode.Line: return "1回目のクリックで始点、2回目で終点。その間に一定間隔で並べます。\nEsc で始点をキャンセル。";
                 case Mode.Grid: return "クリック位置をグリッドにスナップして配置します。\nカーソル付近にグリッド線を表示します。";
                 case Mode.Connect: return "基準パーツの端（カーソルに近い面）に次のパーツをくっつけて配置します。\n基準が無いときは最初のクリックで普通に配置し、それが基準になります。\n配置するたびに基準は最新のパーツに切り替わります。";
+                case Mode.Utility: return "【名前の (1) を削除】選択オブジェクトの名前末尾の \" (1)\" \"(2)\" などを消します。\n【同じプレハブを一括選択】選択オブジェクトと同じプレハブのインスタンスを、開いているシーンからまとめて選択します。";
                 case Mode.CopyUp: return "ヒエラルキー／シーンで選んだオブジェクトを、回転・スケールそのままで指定の高さ上に複製します。\nプレハブのリンクも保持されます。";
             }
             return "";
@@ -421,7 +432,7 @@ namespace PlacementTool.Editor
 
         void OnSceneGUI(SceneView sv)
         {
-            if (!sceneInputEnabled || mode == Mode.CopyUp) return;
+            if (!sceneInputEnabled || mode >= Mode.CopyUp) return;
 
             Event e = Event.current;
             if (e.type == EventType.Repaint) DrawHud();
@@ -915,6 +926,137 @@ namespace PlacementTool.Editor
         }
 
         // =====================================================================
+        // ⑥ 選択・名前
+        // =====================================================================
+
+        void DrawUtilityGUI()
+        {
+            var sceneObjects = GetSelectedSceneObjects();
+
+            EditorGUILayout.LabelField("名前の (1) を削除", EditorStyles.boldLabel);
+            renameIncludeChildren = EditorGUILayout.Toggle("子オブジェクトも対象", renameIncludeChildren);
+            renameRemoveClone = EditorGUILayout.Toggle("\"(Clone)\" も削除", renameRemoveClone);
+            using (new EditorGUI.DisabledScope(sceneObjects.Length == 0))
+            {
+                if (GUILayout.Button($"選択中の {sceneObjects.Length} 個をリネーム", GUILayout.Height(28)))
+                    RemoveNumberSuffix(sceneObjects, renameIncludeChildren, renameRemoveClone);
+            }
+
+            EditorGUILayout.Space(10);
+            EditorGUILayout.LabelField("同じプレハブを一括選択", EditorStyles.boldLabel);
+            selectMatchVariantBase = EditorGUILayout.Toggle(
+                new GUIContent("バリアントも同一とみなす", "ON: 元をたどった大本のプレハブで比較（バリアント違いもまとめて選択）\nOFF: 直接参照しているプレハブ（バリアント）単位で比較"),
+                selectMatchVariantBase);
+            selectIncludeInactive = EditorGUILayout.Toggle("非アクティブも含める", selectIncludeInactive);
+
+            var sources = GetSourcePrefabs(sceneObjects, selectMatchVariantBase);
+            if (sources.Count > 0)
+                EditorGUILayout.LabelField("対象プレハブ", string.Join(", ", sources.Select(s => s.name)), EditorStyles.wordWrappedMiniLabel);
+
+            using (new EditorGUI.DisabledScope(sources.Count == 0))
+            {
+                if (GUILayout.Button("同じプレハブのオブジェクトをシーンから全選択", GUILayout.Height(28)))
+                    SelectSamePrefabInstances(sources, selectMatchVariantBase, selectIncludeInactive);
+            }
+            if (sceneObjects.Length > 0 && sources.Count == 0)
+                EditorGUILayout.HelpBox("選択中のオブジェクトはプレハブのインスタンスではありません。", MessageType.None);
+        }
+
+        static GameObject[] GetSelectedSceneObjects()
+        {
+            return Selection.gameObjects.Where(g => g && !EditorUtility.IsPersistent(g)).ToArray();
+        }
+
+        // 末尾の " (1)" "(12)" を（連続していても）まとめて削除。オプションで "(Clone)" も
+        static readonly Regex NumberSuffix = new Regex(@"(\s*\(\d+\))+\s*$", RegexOptions.Compiled);
+        static readonly Regex NumberOrCloneSuffix = new Regex(@"(\s*\((\d+|Clone)\))+\s*$", RegexOptions.Compiled);
+
+        static void RemoveNumberSuffix(GameObject[] targets, bool includeChildren, bool removeClone)
+        {
+            var regex = removeClone ? NumberOrCloneSuffix : NumberSuffix;
+            var all = includeChildren
+                ? targets.SelectMany(t => t.GetComponentsInChildren<Transform>(true)).Select(t => t.gameObject).Distinct()
+                : targets;
+
+            Undo.IncrementCurrentGroup();
+            int group = Undo.GetCurrentGroup();
+            Undo.SetCurrentGroupName("Remove Number Suffix");
+
+            int changed = 0;
+            foreach (var go in all)
+            {
+                string newName = regex.Replace(go.name, "");
+                if (newName.Length == 0 || newName == go.name) continue;
+                Undo.RecordObject(go, "Remove Number Suffix");
+                go.name = newName;
+                changed++;
+            }
+
+            Undo.CollapseUndoOperations(group);
+            Debug.Log($"[Placement Tool] {changed} 個のオブジェクトをリネームしました。");
+        }
+
+        // 選択オブジェクトが属するプレハブ（子を選んでいても最寄りのインスタンスルートから取得）
+        static List<GameObject> GetSourcePrefabs(GameObject[] sceneObjects, bool originalSource)
+        {
+            var result = new List<GameObject>();
+            foreach (var go in sceneObjects)
+            {
+                var root = PrefabUtility.GetNearestPrefabInstanceRoot(go);
+                if (!root) continue;
+                var asset = GetPrefabSource(root, originalSource);
+                if (asset && !result.Contains(asset)) result.Add(asset);
+            }
+            return result;
+        }
+
+        static GameObject GetPrefabSource(GameObject instanceRoot, bool originalSource)
+        {
+            return originalSource
+                ? PrefabUtility.GetCorrespondingObjectFromOriginalSource(instanceRoot)
+                : PrefabUtility.GetCorrespondingObjectFromSource(instanceRoot);
+        }
+
+        static void SelectSamePrefabInstances(List<GameObject> sources, bool originalSource, bool includeInactive)
+        {
+            var targets = new HashSet<GameObject>(sources);
+            var found = new List<Object>();
+
+            foreach (var scene in GetSearchScenes())
+            {
+                foreach (var rootObj in scene.GetRootGameObjects())
+                {
+                    foreach (var t in rootObj.GetComponentsInChildren<Transform>(true))
+                    {
+                        var go = t.gameObject;
+                        if (!includeInactive && !go.activeInHierarchy) continue;
+                        if (!PrefabUtility.IsAnyPrefabInstanceRoot(go)) continue;
+                        var src = GetPrefabSource(go, originalSource);
+                        if (src && targets.Contains(src)) found.Add(go);
+                    }
+                }
+            }
+
+            Selection.objects = found.ToArray();
+            Debug.Log($"[Placement Tool] {found.Count} 個を選択しました（{string.Join(", ", sources.Select(s => s.name))}）。");
+        }
+
+        static IEnumerable<Scene> GetSearchScenes()
+        {
+            var stage = PrefabStageUtility.GetCurrentPrefabStage();
+            if (stage != null)
+            {
+                yield return stage.scene;
+                yield break;
+            }
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                var s = SceneManager.GetSceneAt(i);
+                if (s.isLoaded) yield return s;
+            }
+        }
+
+        // =====================================================================
         // ユーティリティ
         // =====================================================================
 
@@ -1055,6 +1197,10 @@ namespace PlacementTool.Editor
             EditorPrefs.SetFloat(Pref + "ConnectGap", connectGap);
             EditorPrefs.SetBool(Pref + "ConnectVertical", connectAllowVertical);
             EditorPrefs.SetFloat(Pref + "CopyHeight", copyHeight);
+            EditorPrefs.SetBool(Pref + "RenameChildren", renameIncludeChildren);
+            EditorPrefs.SetBool(Pref + "RenameClone", renameRemoveClone);
+            EditorPrefs.SetBool(Pref + "SelectVariantBase", selectMatchVariantBase);
+            EditorPrefs.SetBool(Pref + "SelectInactive", selectIncludeInactive);
         }
 
         void LoadPrefs()
@@ -1086,6 +1232,10 @@ namespace PlacementTool.Editor
             connectGap = EditorPrefs.GetFloat(Pref + "ConnectGap", connectGap);
             connectAllowVertical = EditorPrefs.GetBool(Pref + "ConnectVertical", connectAllowVertical);
             copyHeight = EditorPrefs.GetFloat(Pref + "CopyHeight", copyHeight);
+            renameIncludeChildren = EditorPrefs.GetBool(Pref + "RenameChildren", renameIncludeChildren);
+            renameRemoveClone = EditorPrefs.GetBool(Pref + "RenameClone", renameRemoveClone);
+            selectMatchVariantBase = EditorPrefs.GetBool(Pref + "SelectVariantBase", selectMatchVariantBase);
+            selectIncludeInactive = EditorPrefs.GetBool(Pref + "SelectInactive", selectIncludeInactive);
             hasCachedBounds = false;
         }
     }
