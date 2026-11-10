@@ -444,7 +444,7 @@ namespace PlacementTool.Editor
                 case Mode.Place: return "シーンビューを左クリックした位置にプレハブを配置します。\nAlt+ドラッグでの視点操作はそのまま使えます。";
                 case Mode.Line: return "1回目のクリックで始点、2回目で終点。その間に一定間隔で並べます。\nEsc で始点をキャンセル。";
                 case Mode.Grid: return "クリック位置をグリッドにスナップして配置します。\nカーソル付近にグリッド線を表示します。";
-                case Mode.ObjectSnap: return "カーソルが指しているオブジェクトのピボット位置を基準に、「ステップ」の倍数（+3, -3, +6 …）の位置にだけスナップして配置します。\n例: ステップ X=3 なら、基準の壁の左右 3m ごとの位置に吸着します。\n配置したパーツにカーソルを合わせれば、そこから続けて置けます。";
+                case Mode.ObjectSnap: return "カーソルが指しているオブジェクトのピボット位置を基準に、「ステップ」の倍数（+3, -3, +6 …）の位置にだけスナップして配置します。\n例: ステップ X=3 なら、基準の壁の左右 3m ごとの位置に吸着します。\nステップ 0 の軸は動かず、基準と同じ位置に固定されます。\n配置したパーツにカーソルを合わせれば、そこから続けて置けます。";
                 case Mode.Connect: return "基準パーツの端（カーソルに近い面）に次のパーツをくっつけて配置します。\n基準が無いときは最初のクリックで普通に配置し、それが基準になります。\n配置するたびに基準は最新のパーツに切り替わります。";
                 case Mode.Utility: return "【名前の (1) を削除】選択オブジェクトの名前末尾の \" (1)\" \"(2)\" などを消します。\n【同じプレハブを一括選択】選択オブジェクトと同じプレハブのインスタンスを、開いているシーンからまとめて選択します。";
                 case Mode.CopyUp: return "ヒエラルキー／シーンで選んだオブジェクトを、回転・スケールそのままで指定の高さ上に複製します。\nプレハブのリンクも保持されます。";
@@ -1023,9 +1023,10 @@ namespace PlacementTool.Editor
         {
             EditorGUILayout.LabelField("オブジェクトスナップ設定", EditorStyles.boldLabel);
             objSnapStep = EditorGUILayout.Vector3Field(
-                new GUIContent("ステップ (m)", "基準オブジェクトからこの距離の倍数の位置にスナップします。0 の軸はスナップせずカーソル位置を使います"),
+                new GUIContent("ステップ (m)", "基準オブジェクトからこの距離の倍数の位置にスナップします。\n0 の軸は動かさず基準と同じ位置に固定します。\nマイナスも入力できます（倍数なので ±どちら向きにもスナップします）"),
                 objSnapStep);
-            objSnapStep = new Vector3(Mathf.Max(0f, objSnapStep.x), Mathf.Max(0f, objSnapStep.y), Mathf.Max(0f, objSnapStep.z));
+            if (objSnapY != SnapYMode.Step && Mathf.Abs(objSnapStep.y) > 1e-4f)
+                EditorGUILayout.LabelField(" ", "※ Y は「高さ」が「ステップでスナップ」のときだけ使われます", EditorStyles.miniLabel);
 
             if (prefab)
             {
@@ -1096,7 +1097,12 @@ namespace PlacementTool.Editor
             snapHasTarget = true;
         }
 
-        static float SnapAxis(float v, float step) => step > 1e-4f ? Mathf.Round(v / step) * step : v;
+        // step = 0 の軸は固定（基準と同じ位置）。符号は無関係（±どちら向きの倍数にもスナップ）
+        static float SnapAxis(float v, float step)
+        {
+            float s = Mathf.Abs(step);
+            return s > 1e-4f ? Mathf.Round(v / s) * s : 0f;
+        }
 
         void DrawObjectSnapPreview(Bounds lb)
         {
@@ -1118,9 +1124,9 @@ namespace PlacementTool.Editor
                 for (int ix = -2; ix <= 2; ix++)
                 for (int iz = -2; iz <= 2; iz++)
                 {
-                    if (objSnapStep.x <= 1e-4f && ix != 0) continue;
-                    if (objSnapStep.z <= 1e-4f && iz != 0) continue;
-                    Vector3 c = bt.position + rot * new Vector3(ix * objSnapStep.x, yOff, iz * objSnapStep.z);
+                    if (Mathf.Abs(objSnapStep.x) <= 1e-4f && ix != 0) continue;
+                    if (Mathf.Abs(objSnapStep.z) <= 1e-4f && iz != 0) continue;
+                    Vector3 c = bt.position + rot * new Vector3(ix * Mathf.Abs(objSnapStep.x), yOff, iz * Mathf.Abs(objSnapStep.z));
                     Handles.DotHandleCap(0, c, Quaternion.identity, HandleUtility.GetHandleSize(c) * 0.03f, EventType.Repaint);
                 }
             }
