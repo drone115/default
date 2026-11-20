@@ -15,6 +15,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Globalization;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using UnityEditor;
@@ -27,11 +28,11 @@ namespace PlacementTool.Editor
 {
     public class PlacementToolWindow : EditorWindow
     {
-        enum Mode { Place, Line, Grid, Connect, CopyUp, Utility, ObjectSnap }
+        enum Mode { Place, Line, Grid, Connect, CopyUp, Utility, ObjectSnap, Scatter }
         enum SnapYMode { SameAsBase, Step, Cursor }
         static readonly GUIContent[] SnapYLabels = { new GUIContent("基準と同じ高さ"), new GUIContent("ステップでスナップ"), new GUIContent("カーソル位置") };
 
-        static readonly string[] ModeLabels = { "① 配置", "② ライン", "③ グリッド", "④ 連結", "⑤ 上にコピー", "⑥ 選択・名前", "⑦ オブジェクトスナップ" };
+        static readonly string[] ModeLabels = { "① 配置", "② ライン", "③ グリッド", "④ 連結", "⑤ 上にコピー", "⑥ 選択・名前", "⑦ オブジェクトスナップ", "⑧ ランダム散布" };
         const string Pref = "PlacementTool.";
         const int MaxLineCount = 1000;
         const int MaxPreviewCount = 300;
@@ -137,12 +138,19 @@ namespace PlacementTool.Editor
         }
 
         void OnFocus() => hasCachedBounds = false;
-        void OnProjectChange() => hasCachedBounds = false;
+        void OnProjectChange()
+        {
+            hasCachedBounds = false;
+            scatterBoundsCache.Clear();
+            scatterPreviewDirty = true;
+        }
 
         void OnSelectionChange()
         {
             if (followProjectSelection && Selection.activeObject is GameObject g && IsPrefabAsset(g))
                 SetPrefab(g);
+            scatterPreviewDirty = true;
+            if (mode == Mode.Scatter) SceneView.RepaintAll();
             Repaint();
         }
 
@@ -152,6 +160,7 @@ namespace PlacementTool.Editor
             if (!anchor && Selection.activeGameObject && !EditorUtility.IsPersistent(Selection.activeGameObject))
                 anchor = Selection.activeGameObject;
             connectHasTarget = false;
+            scatterPreviewDirty = true;
             Repaint();
             SceneView.RepaintAll();
         }
@@ -159,7 +168,7 @@ namespace PlacementTool.Editor
         void OnGUI()
         {
             EditorGUI.BeginChangeCheck();
-            var newMode = (Mode)GUILayout.SelectionGrid((int)mode, ModeLabels, 3, GUILayout.Height(72));
+            var newMode = (Mode)GUILayout.SelectionGrid((int)mode, ModeLabels, 4, GUILayout.Height(48));
             if (EditorGUI.EndChangeCheck())
             {
                 mode = newMode;
@@ -179,6 +188,10 @@ namespace PlacementTool.Editor
             else if (mode == Mode.Utility)
             {
                 DrawUtilityGUI();
+            }
+            else if (mode == Mode.Scatter)
+            {
+                DrawScatterGUI();
             }
             else
             {
@@ -202,6 +215,7 @@ namespace PlacementTool.Editor
 
             if (EditorGUI.EndChangeCheck())
             {
+                scatterPreviewDirty = true;
                 SavePrefs();
                 SceneView.RepaintAll();
             }
@@ -444,6 +458,7 @@ namespace PlacementTool.Editor
                 case Mode.Place: return "シーンビューを左クリックした位置にプレハブを配置します。\nAlt+ドラッグでの視点操作はそのまま使えます。";
                 case Mode.Line: return "1回目のクリックで始点、2回目で終点。その間に一定間隔で並べます。\nEsc で始点をキャンセル。";
                 case Mode.Grid: return "クリック位置をグリッドにスナップして配置します。\nカーソル付近にグリッド線を表示します。";
+                case Mode.Scatter: return "シーンで地面にしたいオブジェクト（メッシュ / Terrain）を選択し、「散布」を押すと、その上面にプレハブをランダムに配置します。\nシーンビューの点がプレビュー（シードが同じなら結果も同じ）です。\n結果は 1 つのグループにまとまり、Ctrl+Z 1 回で消せます。";
                 case Mode.ObjectSnap: return "カーソルが指しているオブジェクトのピボット位置を基準に、「ステップ」の倍数（+3, -3, +6 …）の位置にだけスナップして配置します。\n例: ステップ X=3 なら、基準の壁の左右 3m ごとの位置に吸着します。\nステップ 0 の軸は動かず、基準と同じ位置に固定されます。\n配置したパーツにカーソルを合わせれば、そこから続けて置けます。";
                 case Mode.Connect: return "基準パーツの端（カーソルに近い面）に次のパーツをくっつけて配置します。\n基準が無いときは最初のクリックで普通に配置し、それが基準になります。\n配置するたびに基準は最新のパーツに切り替わります。";
                 case Mode.Utility: return "【名前の (1) を削除】選択オブジェクトの名前末尾の \" (1)\" \"(2)\" などを消します。\n【同じプレハブを一括選択】選択オブジェクトと同じプレハブのインスタンスを、開いているシーンからまとめて選択します。";
@@ -458,6 +473,11 @@ namespace PlacementTool.Editor
 
         void OnSceneGUI(SceneView sv)
         {
+            if (mode == Mode.Scatter)
+            {
+                if (Event.current.type == EventType.Repaint) DrawScatterPreview();
+                return;
+            }
             if (!sceneInputEnabled || mode == Mode.CopyUp || mode == Mode.Utility) return;
 
             Event e = Event.current;
@@ -1016,6 +1036,526 @@ namespace PlacementTool.Editor
         }
 
         // =====================================================================
+        // ⑧ ランダム散布
+        // =====================================================================
+
+        [Serializable]
+        class ScatterItem
+        {
+            public GameObject prefab;
+            public float weight = 1f;
+        }
+
+        struct ScatterPoint
+        {
+            public Vector3 position;
+            public Vector3 normal;
+            public int item;
+            public float yaw;
+            public float scale;
+        }
+
+        struct ScatterTri
+        {
+            public Vector3 a, b, c, n;
+            public Terrain terrain;
+        }
+
+        const int MaxScatterCount = 5000;
+        const int MaxScatterPreview = 3000;
+
+        [SerializeField] List<ScatterItem> scatterItems = new List<ScatterItem>();
+        [SerializeField] bool scatterUseDensity;
+        [SerializeField] int scatterCount = 50;
+        [SerializeField] float scatterDensity = 0.5f;
+        [SerializeField] float scatterMinDistance = 0.3f;
+        [SerializeField] float scatterMaxSlope = 30f;
+        [SerializeField] bool scatterIncludeChildren = true;
+        [SerializeField] bool scatterRandomYaw = true;
+        [SerializeField] bool scatterAlignNormal;
+        [SerializeField] bool scatterRandomScale;
+        [SerializeField] Vector2 scatterScaleRange = new Vector2(0.8f, 1.2f);
+        [SerializeField] bool scatterAlignBottom = true;
+        [SerializeField] float scatterHeightOffset;
+        [SerializeField] int scatterSeed = 12345;
+        [SerializeField] bool scatterShowPreview = true;
+        [SerializeField] GameObject scatterLastGroup;
+
+        List<ScatterPoint> scatterPreview = new List<ScatterPoint>();
+        bool scatterPreviewDirty = true;
+        string scatterStatus = "";
+        readonly Dictionary<GameObject, Bounds> scatterBoundsCache = new Dictionary<GameObject, Bounds>();
+
+        void DrawScatterGUI()
+        {
+            var grounds = GetScatterGrounds();
+            EditorGUILayout.LabelField("地面", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("選択中", grounds.Count > 0
+                ? $"{grounds.Count} 個（{string.Join(", ", grounds.Take(3).Select(g => g.name))}{(grounds.Count > 3 ? " …" : "")}）"
+                : "シーンで地面オブジェクトを選択してください");
+            scatterIncludeChildren = EditorGUILayout.Toggle("子オブジェクトも地面にする", scatterIncludeChildren);
+            scatterMaxSlope = EditorGUILayout.Slider(new GUIContent("傾斜の上限 (°)", "これより急な面には置きません（0 = 真上向きの面だけ）"), scatterMaxSlope, 0f, 89f);
+
+            EditorGUILayout.Space(6);
+            EditorGUILayout.LabelField("散布するプレハブ（比率が大きいほど多く出る）", EditorStyles.boldLabel);
+            DrawScatterItems();
+
+            EditorGUILayout.Space(6);
+            EditorGUILayout.LabelField("量・間隔", EditorStyles.boldLabel);
+            scatterUseDensity = EditorGUILayout.Popup("指定方法", scatterUseDensity ? 1 : 0, new[] { "個数", "密度（1m² あたり）" }) == 1;
+            if (scatterUseDensity) scatterDensity = Mathf.Max(0f, EditorGUILayout.FloatField("密度 (個/m²)", scatterDensity));
+            else scatterCount = Mathf.Clamp(EditorGUILayout.IntField("個数", scatterCount), 0, MaxScatterCount);
+            scatterMinDistance = Mathf.Max(0f, EditorGUILayout.FloatField(new GUIContent("最小間隔 (m)", "オブジェクト同士がこれより近づかないようにします"), scatterMinDistance));
+
+            EditorGUILayout.Space(6);
+            EditorGUILayout.LabelField("ばらつき", EditorStyles.boldLabel);
+            scatterRandomYaw = EditorGUILayout.Toggle("Y 回転をランダム", scatterRandomYaw);
+            scatterAlignNormal = EditorGUILayout.Toggle(new GUIContent("面の傾きに合わせる", "坂の上では坂に沿って傾けます"), scatterAlignNormal);
+            scatterRandomScale = EditorGUILayout.Toggle("スケールをランダム", scatterRandomScale);
+            if (scatterRandomScale)
+            {
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    EditorGUILayout.PrefixLabel("  倍率 最小 / 最大");
+                    scatterScaleRange.x = Mathf.Max(0.01f, EditorGUILayout.FloatField(scatterScaleRange.x));
+                    scatterScaleRange.y = Mathf.Max(scatterScaleRange.x, EditorGUILayout.FloatField(scatterScaleRange.y));
+                }
+            }
+            scatterAlignBottom = EditorGUILayout.Toggle(new GUIContent("底面を接地", "ピボットではなくバウンズの底面を地面に合わせます"), scatterAlignBottom);
+            scatterHeightOffset = EditorGUILayout.FloatField(new GUIContent("高さオフセット (m)", "マイナスで少し埋める"), scatterHeightOffset);
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                scatterSeed = EditorGUILayout.IntField("シード", scatterSeed);
+                if (GUILayout.Button("ランダム", GUILayout.Width(70))) scatterSeed = NewSeed();
+            }
+            scatterShowPreview = EditorGUILayout.Toggle("シーンにプレビュー表示", scatterShowPreview);
+
+            EditorGUILayout.Space(6);
+            if (scatterPreviewDirty) RebuildScatterPreview();
+            if (!string.IsNullOrEmpty(scatterStatus))
+                EditorGUILayout.HelpBox(scatterStatus, scatterPreview.Count > 0 ? MessageType.None : MessageType.Warning);
+
+            using (new EditorGUI.DisabledScope(scatterPreview.Count == 0))
+            {
+                if (GUILayout.Button("散布", GUILayout.Height(32)))
+                    ExecuteScatter(false);
+            }
+            using (new EditorGUI.DisabledScope(!scatterLastGroup))
+            {
+                if (GUILayout.Button("前回の結果を消して、別のシードで再散布"))
+                {
+                    scatterSeed = NewSeed();
+                    scatterPreviewDirty = true;
+                    ExecuteScatter(true);
+                }
+            }
+        }
+
+        static int NewSeed() => UnityEngine.Random.Range(1, int.MaxValue);
+
+        void DrawScatterItems()
+        {
+            scatterItems.RemoveAll(i => i == null);
+            int remove = -1;
+            for (int i = 0; i < scatterItems.Count; i++)
+            {
+                var it = scatterItems[i];
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    var picked = (GameObject)EditorGUILayout.ObjectField(it.prefab, typeof(GameObject), false);
+                    if (picked != it.prefab && (picked == null || IsPrefabAsset(picked))) it.prefab = picked;
+                    EditorGUILayout.LabelField("比率", GUILayout.Width(30));
+                    it.weight = Mathf.Max(0f, EditorGUILayout.FloatField(it.weight, GUILayout.Width(45)));
+                    if (GUILayout.Button("×", GUILayout.Width(22))) remove = i;
+                }
+            }
+            if (remove >= 0) { scatterItems.RemoveAt(remove); GUI.changed = true; }
+
+            Rect drop = GUILayoutUtility.GetRect(0, 34, GUILayout.ExpandWidth(true));
+            GUI.Box(drop, "ここにプレハブをドラッグ＆ドロップ（複数可）");
+            Event e = Event.current;
+            if ((e.type == EventType.DragUpdated || e.type == EventType.DragPerform) && drop.Contains(e.mousePosition))
+            {
+                var items = DragAndDrop.objectReferences.OfType<GameObject>().Where(IsPrefabAsset).ToList();
+                if (items.Count > 0)
+                {
+                    DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+                    if (e.type == EventType.DragPerform)
+                    {
+                        DragAndDrop.AcceptDrag();
+                        AddScatterItems(items);
+                    }
+                    e.Use();
+                }
+            }
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("Projectで選択中を追加"))
+                    AddScatterItems(Selection.objects.OfType<GameObject>().Where(IsPrefabAsset));
+                if (GUILayout.Button("パレットから追加"))
+                    AddScatterItems(palette);
+                if (GUILayout.Button("クリア", GUILayout.Width(60)) && scatterItems.Count > 0)
+                {
+                    scatterItems.Clear();
+                    GUI.changed = true;
+                }
+            }
+        }
+
+        void AddScatterItems(IEnumerable<GameObject> prefabs)
+        {
+            foreach (var g in prefabs)
+                if (g && scatterItems.All(i => i.prefab != g))
+                    scatterItems.Add(new ScatterItem { prefab = g, weight = 1f });
+            GUI.changed = true;
+            scatterPreviewDirty = true;
+            SavePrefs();
+            SceneView.RepaintAll();
+        }
+
+        static List<GameObject> GetScatterGrounds()
+        {
+            return Selection.gameObjects.Where(g => g && !EditorUtility.IsPersistent(g)).ToList();
+        }
+
+        void RebuildScatterPreview()
+        {
+            scatterPreview = GenerateScatter(out scatterStatus);
+            scatterPreviewDirty = false;
+        }
+
+        // 地面の上向きの面（傾斜の上限以内）を三角形リストとして集める。Terrain は 1 要素として扱う
+        bool BuildScatterSurface(List<GameObject> grounds, List<ScatterTri> tris, List<float> cumulative, out float totalArea, out int unreadable)
+        {
+            totalArea = 0f;
+            unreadable = 0;
+            float cosMax = Mathf.Cos(scatterMaxSlope * Mathf.Deg2Rad) - 1e-4f;
+
+            var filters = new HashSet<MeshFilter>();
+            var terrains = new HashSet<Terrain>();
+            foreach (var g in grounds)
+            {
+                if (scatterIncludeChildren)
+                {
+                    foreach (var mf in g.GetComponentsInChildren<MeshFilter>()) filters.Add(mf);
+                    foreach (var t in g.GetComponentsInChildren<Terrain>()) terrains.Add(t);
+                }
+                else
+                {
+                    if (g.TryGetComponent(out MeshFilter mf)) filters.Add(mf);
+                    if (g.TryGetComponent(out Terrain t)) terrains.Add(t);
+                }
+            }
+
+            foreach (var mf in filters)
+            {
+                var mesh = mf.sharedMesh;
+                if (!mesh) continue;
+                if (mf.TryGetComponent(out MeshRenderer mr) && !mr.enabled) continue;
+
+                Vector3[] v;
+                int[] idx;
+                try
+                {
+                    v = mesh.vertices;
+                    idx = mesh.triangles;
+                }
+                catch (Exception)
+                {
+                    unreadable++;
+                    continue;
+                }
+                if (v == null || v.Length == 0 || idx == null || idx.Length == 0)
+                {
+                    unreadable++;
+                    continue;
+                }
+
+                Matrix4x4 m = mf.transform.localToWorldMatrix;
+                bool flip = m.determinant < 0f;
+                for (int i = 0; i < v.Length; i++) v[i] = m.MultiplyPoint3x4(v[i]);
+
+                for (int i = 0; i + 2 < idx.Length; i += 3)
+                {
+                    Vector3 a = v[idx[i]], b = v[idx[i + 1]], c = v[idx[i + 2]];
+                    Vector3 cross = Vector3.Cross(b - a, c - a);
+                    float area = cross.magnitude * 0.5f;
+                    if (area < 1e-6f) continue;
+                    Vector3 n = cross.normalized;
+                    if (flip) n = -n;
+                    if (n.y < cosMax) continue; // 下向き・急斜面は除外
+
+                    totalArea += area;
+                    tris.Add(new ScatterTri { a = a, b = b, c = c, n = n });
+                    cumulative.Add(totalArea);
+                }
+            }
+
+            foreach (var t in terrains)
+            {
+                if (!t.terrainData || !t.enabled) continue;
+                var size = t.terrainData.size;
+                totalArea += size.x * size.z;
+                tris.Add(new ScatterTri { terrain = t });
+                cumulative.Add(totalArea);
+            }
+            return totalArea > 0f;
+        }
+
+        List<ScatterPoint> GenerateScatter(out string status)
+        {
+            var result = new List<ScatterPoint>();
+            var items = scatterItems.Where(i => i != null && i.prefab && i.weight > 0f).ToList();
+            var grounds = GetScatterGrounds();
+
+            if (items.Count == 0) { status = "散布するプレハブを追加してください。"; return result; }
+            if (grounds.Count == 0) { status = "シーンで地面にするオブジェクトを選択してください。"; return result; }
+
+            var tris = new List<ScatterTri>();
+            var cumulative = new List<float>();
+            if (!BuildScatterSurface(grounds, tris, cumulative, out float totalArea, out int unreadable))
+            {
+                status = unreadable > 0
+                    ? "メッシュを読み取れませんでした（モデルの Import Settings で Read/Write を ON にしてください）。"
+                    : "置ける上向きの面がありません（「傾斜の上限」や選択を確認してください）。";
+                return result;
+            }
+
+            int target = scatterUseDensity ? Mathf.RoundToInt(totalArea * scatterDensity) : scatterCount;
+            target = Mathf.Clamp(target, 0, MaxScatterCount);
+
+            var rng = new System.Random(scatterSeed);
+            float Next() => (float)rng.NextDouble();
+
+            float weightSum = items.Sum(i => i.weight);
+            float cosMax = Mathf.Cos(scatterMaxSlope * Mathf.Deg2Rad) - 1e-4f;
+            float minD = scatterMinDistance;
+            float minD2 = minD * minD;
+            var hash = new Dictionary<Vector3Int, List<Vector3>>();
+            Vector3Int Cell(Vector3 p) => new Vector3Int(Mathf.FloorToInt(p.x / minD), Mathf.FloorToInt(p.y / minD), Mathf.FloorToInt(p.z / minD));
+
+            int attempts = target * 30 + 100;
+            while (result.Count < target && attempts-- > 0)
+            {
+                float r = Next() * totalArea;
+                int ti = cumulative.BinarySearch(r);
+                if (ti < 0) ti = ~ti;
+                ti = Mathf.Min(ti, tris.Count - 1);
+                var tri = tris[ti];
+
+                Vector3 pos, normal;
+                if (tri.terrain)
+                {
+                    var td = tri.terrain.terrainData;
+                    Vector3 tp = tri.terrain.transform.position;
+                    float u = Next(), w = Next();
+                    pos = tp + new Vector3(u * td.size.x, 0f, w * td.size.z);
+                    pos.y = tp.y + tri.terrain.SampleHeight(pos);
+                    normal = td.GetInterpolatedNormal(u, w);
+                    if (normal.y < cosMax) continue;
+                }
+                else
+                {
+                    float r1 = Next(), r2 = Next();
+                    if (r1 + r2 > 1f) { r1 = 1f - r1; r2 = 1f - r2; }
+                    pos = tri.a + r1 * (tri.b - tri.a) + r2 * (tri.c - tri.a);
+                    normal = tri.n;
+                }
+
+                if (minD > 1e-4f)
+                {
+                    var c = Cell(pos);
+                    bool tooClose = false;
+                    for (int dx = -1; dx <= 1 && !tooClose; dx++)
+                    for (int dy = -1; dy <= 1 && !tooClose; dy++)
+                    for (int dz = -1; dz <= 1 && !tooClose; dz++)
+                    {
+                        if (!hash.TryGetValue(new Vector3Int(c.x + dx, c.y + dy, c.z + dz), out var list)) continue;
+                        foreach (var q in list)
+                            if ((q - pos).sqrMagnitude < minD2) { tooClose = true; break; }
+                    }
+                    if (tooClose) continue;
+                    if (!hash.TryGetValue(c, out var cellList)) hash[c] = cellList = new List<Vector3>();
+                    cellList.Add(pos);
+                }
+
+                float pick = Next() * weightSum;
+                int item = 0;
+                for (; item < items.Count - 1; item++)
+                {
+                    pick -= items[item].weight;
+                    if (pick < 0f) break;
+                }
+
+                result.Add(new ScatterPoint
+                {
+                    position = pos,
+                    normal = normal,
+                    item = scatterItems.IndexOf(items[item]),
+                    yaw = scatterRandomYaw ? Next() * 360f : 0f,
+                    scale = scatterRandomScale ? Mathf.Lerp(scatterScaleRange.x, scatterScaleRange.y, Next()) : 1f,
+                });
+            }
+
+            status = $"{result.Count} / {target} 個（置ける面積 {totalArea:0.#} m²）";
+            if (result.Count < target) status += "\n最小間隔が大きいため、全部は置けませんでした。";
+            if (unreadable > 0) status += $"\n読み取れないメッシュが {unreadable} 個ありました（Read/Write を ON にすると対象になります）。";
+            return result;
+        }
+
+        Bounds GetScatterLocalBounds(GameObject pf)
+        {
+            if (!scatterBoundsCache.TryGetValue(pf, out var lb))
+            {
+                lb = TryGetWorldBounds(pf, out var b)
+                    ? new Bounds(b.center - pf.transform.position, b.size)
+                    : new Bounds(Vector3.zero, Vector3.one * 0.2f);
+                scatterBoundsCache[pf] = lb;
+            }
+            return lb;
+        }
+
+        void GetScatterPose(ScatterPoint p, GameObject pf, out Vector3 position, out Quaternion extraRotation)
+        {
+            Quaternion basis = scatterAlignNormal ? Quaternion.FromToRotation(Vector3.up, p.normal) : Quaternion.identity;
+            extraRotation = basis * Quaternion.Euler(0f, p.yaw, 0f);
+            float lift = scatterHeightOffset;
+            if (scatterAlignBottom) lift -= GetScatterLocalBounds(pf).min.y * p.scale;
+            position = p.position + basis * Vector3.up * lift;
+        }
+
+        void DrawScatterPreview()
+        {
+            if (!scatterShowPreview) return;
+            if (scatterPreviewDirty) RebuildScatterPreview();
+
+            int n = Mathf.Min(scatterPreview.Count, MaxScatterPreview);
+            for (int i = 0; i < n; i++)
+            {
+                var p = scatterPreview[i];
+                if (p.item < 0 || p.item >= scatterItems.Count || !scatterItems[p.item].prefab) continue;
+                var pf = scatterItems[p.item].prefab;
+                var lb = GetScatterLocalBounds(pf);
+                float radius = Mathf.Max(0.05f, Mathf.Max(lb.extents.x, lb.extents.z) * p.scale);
+                Color col = Color.HSVToRGB((p.item * 0.618f) % 1f, 0.7f, 1f);
+                Handles.color = col;
+                Handles.DrawWireDisc(p.position, scatterAlignNormal ? p.normal : Vector3.up, radius);
+                Handles.DrawLine(p.position, p.position + (scatterAlignNormal ? p.normal : Vector3.up) * radius);
+            }
+
+            Handles.BeginGUI();
+            var content = new GUIContent($"Placement Tool  ⑧ ランダム散布\n{scatterStatus}");
+            Vector2 size = EditorStyles.helpBox.CalcSize(content);
+            GUI.Label(new Rect(10, 10, size.x + 8, size.y + 4), content, EditorStyles.helpBox);
+            Handles.EndGUI();
+        }
+
+        void ExecuteScatter(bool replaceLast)
+        {
+            var grounds = GetScatterGrounds();
+            Undo.IncrementCurrentGroup();
+            int group = Undo.GetCurrentGroup();
+            Undo.SetCurrentGroupName("Scatter Prefabs");
+
+            if (replaceLast && scatterLastGroup && !grounds.Contains(scatterLastGroup))
+                Undo.DestroyObjectImmediate(scatterLastGroup);
+
+            var points = GenerateScatter(out scatterStatus);
+            scatterPreview = points;
+            scatterPreviewDirty = false;
+            if (points.Count == 0)
+            {
+                ShowNotification(new GUIContent(scatterStatus));
+                Undo.CollapseUndoOperations(group);
+                return;
+            }
+
+            // まとめ用の空オブジェクト（地面と同じシーン / Prefab モード中はそのルート配下）
+            var root = new GameObject($"Scatter_{grounds[0].name}");
+            var stage = PrefabStageUtility.GetCurrentPrefabStage();
+            if (stage != null) root.transform.SetParent(stage.prefabContentsRoot.transform, false);
+            else if (root.scene != grounds[0].scene) SceneManager.MoveGameObjectToScene(root, grounds[0].scene);
+            Undo.RegisterCreatedObjectUndo(root, "Scatter Prefabs");
+
+            foreach (var p in points)
+            {
+                var pf = scatterItems[p.item].prefab;
+                var go = PrefabUtility.InstantiatePrefab(pf, root.scene) as GameObject;
+                if (!go) continue;
+                go.transform.SetParent(root.transform, true);
+                GetScatterPose(p, pf, out var pos, out var extra);
+                go.transform.SetPositionAndRotation(pos, extra * go.transform.rotation);
+                if (!Mathf.Approximately(p.scale, 1f)) go.transform.localScale *= p.scale;
+                Undo.RegisterCreatedObjectUndo(go, "Scatter Prefabs");
+            }
+
+            scatterLastGroup = root;
+            Undo.CollapseUndoOperations(group);
+            EditorGUIUtility.PingObject(root);
+            SceneView.RepaintAll();
+        }
+
+        void SaveScatterPrefs()
+        {
+            var ci = CultureInfo.InvariantCulture;
+            EditorPrefs.SetString(Pref + "ScatterItems", string.Join(";",
+                scatterItems.Where(i => i != null && i.prefab).Select(i => GuidOf(i.prefab) + "|" + i.weight.ToString(ci))));
+            EditorPrefs.SetBool(Pref + "ScatterUseDensity", scatterUseDensity);
+            EditorPrefs.SetInt(Pref + "ScatterCount", scatterCount);
+            EditorPrefs.SetFloat(Pref + "ScatterDensity", scatterDensity);
+            EditorPrefs.SetFloat(Pref + "ScatterMinDist", scatterMinDistance);
+            EditorPrefs.SetFloat(Pref + "ScatterSlope", scatterMaxSlope);
+            EditorPrefs.SetBool(Pref + "ScatterChildren", scatterIncludeChildren);
+            EditorPrefs.SetBool(Pref + "ScatterYaw", scatterRandomYaw);
+            EditorPrefs.SetBool(Pref + "ScatterNormal", scatterAlignNormal);
+            EditorPrefs.SetBool(Pref + "ScatterRandScale", scatterRandomScale);
+            EditorPrefs.SetFloat(Pref + "ScatterScaleMin", scatterScaleRange.x);
+            EditorPrefs.SetFloat(Pref + "ScatterScaleMax", scatterScaleRange.y);
+            EditorPrefs.SetBool(Pref + "ScatterBottom", scatterAlignBottom);
+            EditorPrefs.SetFloat(Pref + "ScatterOffset", scatterHeightOffset);
+            EditorPrefs.SetInt(Pref + "ScatterSeed", scatterSeed);
+            EditorPrefs.SetBool(Pref + "ScatterPreview", scatterShowPreview);
+        }
+
+        void LoadScatterPrefs()
+        {
+            string s = EditorPrefs.GetString(Pref + "ScatterItems", "");
+            if (!string.IsNullOrEmpty(s))
+            {
+                scatterItems = new List<ScatterItem>();
+                foreach (var entry in s.Split(';'))
+                {
+                    var parts = entry.Split('|');
+                    var pf = LoadByGuid(parts[0]);
+                    if (!pf) continue;
+                    float w = 1f;
+                    if (parts.Length > 1) float.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out w);
+                    scatterItems.Add(new ScatterItem { prefab = pf, weight = w });
+                }
+            }
+            scatterItems ??= new List<ScatterItem>();
+            scatterUseDensity = EditorPrefs.GetBool(Pref + "ScatterUseDensity", scatterUseDensity);
+            scatterCount = EditorPrefs.GetInt(Pref + "ScatterCount", scatterCount);
+            scatterDensity = EditorPrefs.GetFloat(Pref + "ScatterDensity", scatterDensity);
+            scatterMinDistance = EditorPrefs.GetFloat(Pref + "ScatterMinDist", scatterMinDistance);
+            scatterMaxSlope = EditorPrefs.GetFloat(Pref + "ScatterSlope", scatterMaxSlope);
+            scatterIncludeChildren = EditorPrefs.GetBool(Pref + "ScatterChildren", scatterIncludeChildren);
+            scatterRandomYaw = EditorPrefs.GetBool(Pref + "ScatterYaw", scatterRandomYaw);
+            scatterAlignNormal = EditorPrefs.GetBool(Pref + "ScatterNormal", scatterAlignNormal);
+            scatterRandomScale = EditorPrefs.GetBool(Pref + "ScatterRandScale", scatterRandomScale);
+            scatterScaleRange = new Vector2(
+                EditorPrefs.GetFloat(Pref + "ScatterScaleMin", scatterScaleRange.x),
+                EditorPrefs.GetFloat(Pref + "ScatterScaleMax", scatterScaleRange.y));
+            scatterAlignBottom = EditorPrefs.GetBool(Pref + "ScatterBottom", scatterAlignBottom);
+            scatterHeightOffset = EditorPrefs.GetFloat(Pref + "ScatterOffset", scatterHeightOffset);
+            scatterSeed = EditorPrefs.GetInt(Pref + "ScatterSeed", scatterSeed);
+            scatterShowPreview = EditorPrefs.GetBool(Pref + "ScatterPreview", scatterShowPreview);
+            scatterPreviewDirty = true;
+        }
+
+        // =====================================================================
         // ⑦ オブジェクトスナップ
         // =====================================================================
 
@@ -1424,6 +1964,7 @@ namespace PlacementTool.Editor
             EditorPrefs.SetBool(Pref + "ObjSnapPrefabRoot", objSnapUsePrefabRoot);
             EditorPrefs.SetBool(Pref + "ObjSnapSkipBase", objSnapSkipBase);
             EditorPrefs.SetBool(Pref + "ObjSnapCandidates", objSnapShowCandidates);
+            SaveScatterPrefs();
             EditorPrefs.SetFloat(Pref + "CopyHeight", copyHeight);
             EditorPrefs.SetBool(Pref + "RenameChildren", renameIncludeChildren);
             EditorPrefs.SetBool(Pref + "RenameClone", renameRemoveClone);
@@ -1470,6 +2011,7 @@ namespace PlacementTool.Editor
             objSnapUsePrefabRoot = EditorPrefs.GetBool(Pref + "ObjSnapPrefabRoot", objSnapUsePrefabRoot);
             objSnapSkipBase = EditorPrefs.GetBool(Pref + "ObjSnapSkipBase", objSnapSkipBase);
             objSnapShowCandidates = EditorPrefs.GetBool(Pref + "ObjSnapCandidates", objSnapShowCandidates);
+            LoadScatterPrefs();
             copyHeight = EditorPrefs.GetFloat(Pref + "CopyHeight", copyHeight);
             renameIncludeChildren = EditorPrefs.GetBool(Pref + "RenameChildren", renameIncludeChildren);
             renameRemoveClone = EditorPrefs.GetBool(Pref + "RenameClone", renameRemoveClone);
